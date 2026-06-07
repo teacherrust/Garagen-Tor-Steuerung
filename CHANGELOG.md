@@ -2,6 +2,19 @@
 
 Alle nennenswerten Aenderungen an diesem Projekt werden in dieser Datei dokumentiert.
 
+## [2.3.0] - 2026-06-07
+
+### Changed
+- Relais-Impuls im Tor-Toggle auf non-blocking Ablauf umgestellt
+- Auto-Close um Serial-Diagnosemeldungen (Impuls, Retry, Erfolg, Fallback) erweitert
+
+## [2.2.0] - 2026-06-07
+
+### Changed
+- Auto-Close auf non-blocking Zustandslogik umgestellt (keine langen `delay`-Schleifen)
+- Bessere Inline-Kommentare an den kritischen Ablaufstellen
+- Versionsstand im Sketch auf 2.2 angehoben
+
 ## [2.1.0] - 2026-06-07
 
 ### Added

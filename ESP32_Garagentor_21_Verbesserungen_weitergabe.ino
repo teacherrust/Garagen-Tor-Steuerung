@@ -6,6 +6,8 @@
   (cc) Volker Rust
   (v)  1.8      09.08.2022
   (v)  2.1      29.09.2025
+  (v)  2.2      07.06.2026
+  (v)  2.3      07.06.2026
 
   in use:
   1x ESP32: mit Webserver !!! W-Lan-Anbindung nötig, oder W-Lan mit ESP aufspannen.
@@ -13,6 +15,13 @@
   1x Doppelrelais: An potentiallosen Schalter-Eingang des Torantriebs.
 
   letzte Änderungen
+    2.3
+    - Relais-Impuls non-blocking (kein delay im Toggle)
+    - Serial-Diagnoseausgaben fuer Auto-Close ergaenzt
+    2.2
+    - Auto-Close nicht-blockierend (ohne lange delay-Schleifen)
+    - Restzeit-Anzeige stabilisiert
+    - Webclient-Timeout gesetzt
   2.1
   - Tore-Klasse - Tore als Objekte
   - Weiniger Strings wegen der Speicherverwaltung
@@ -59,25 +68,43 @@ private:
     bool closed;  // Status des Tores
     unsigned long openTime;  // Zeit, zu der das Tor geöffnet wurde
     unsigned long lastSwitched;  // Zeit, zu der das Tor zuletzt geschaltet wurde
+    bool pulseActive;  // HIGH-Impuls fuer den Relaiskontakt ist aktiv
+    unsigned long pulseStartTime;  // Startzeit des aktuellen Impulses
 
 public:
     Tor(int pinNumber, int messPinNumber) 
-        : pin(pinNumber), messPin(messPinNumber), closed(true), openTime(0), lastSwitched(0) {
+        : pin(pinNumber), messPin(messPinNumber), closed(true), openTime(0), lastSwitched(0), pulseActive(false), pulseStartTime(0) {
         pinMode(pin, OUTPUT);
         pinMode(messPin, INPUT);
         digitalWrite(pin, LOW);
     }
 
-    void toggle() {
+    bool toggle() {
+        if (pulseActive) {
+            return false;
+        }
+
         digitalWrite(pin, HIGH);
-        delay(DOOR_IMPULSE_DURATION);
-        digitalWrite(pin, LOW);
-        lastSwitched = millis();
+        pulseActive = true;
+        pulseStartTime = millis();
+        lastSwitched = pulseStartTime;
+
+        // Logischer Statuswechsel wird sofort vorgemerkt und danach
+        // weiterhin zyklisch ueber den Sensor abgeglichen.
         closed = !closed;  // Status umkehren
         if (!closed) {
-            openTime = millis();  // Tor geöffnet
+            openTime = pulseStartTime;  // Tor geoeffnet
         } else {
             openTime = 0;  // Tor geschlossen
+        }
+
+        return true;
+    }
+
+    void updatePulse() {
+        if (pulseActive && millis() - pulseStartTime >= DOOR_IMPULSE_DURATION) {
+            digitalWrite(pin, LOW);
+            pulseActive = false;
         }
     }
 
@@ -112,14 +139,31 @@ Tor torLinks(PIN_TOR_LINKS, PIN_MESS_LINKS);
 Tor torRechts(PIN_TOR_RECHTS, PIN_MESS_RECHTS);
 unsigned long openTime = OPEN_TIME_DEFAULT;
 unsigned long previousMillis = 0;
+unsigned long wifiReconnectCount = 0;
+
+struct DoorCloseState {
+    bool waitingForCloseCheck;
+    unsigned long nextCheckMillis;
+    int attempts;
+};
+
+// Einfache Zustandsmaschine fuer den non-blocking Auto-Close pro Tor.
+Tor* tores[] = { &torLinks, &torRechts };
+const char* torNamen[] = { "Links", "Rechts" };
+DoorCloseState closeStates[2] = {
+    { false, 0, 0 },
+    { false, 0, 0 }
+};
 
 void setup() {
     Serial.begin(115200);
-    initWiFi();
+    initWiFi(false);
     server.begin();
 }
 
 void loop() {
+    torLinks.updatePulse();
+    torRechts.updatePulse();
     checkAndReconnectWiFi();
     torLinks.checkStatus();
     torRechts.checkStatus();
@@ -127,7 +171,7 @@ void loop() {
     automaticDoorClose();
 }
 
-void initWiFi() {
+void initWiFi(bool countAsReconnect) {
     Serial.print("Verbinde mit WiFi ");
     Serial.println(ssid);
     WiFi.begin(ssid, password);
@@ -148,6 +192,12 @@ void initWiFi() {
     Serial.println("WiFi verbunden.");
     Serial.print("IP-Adresse: ");
     Serial.println(WiFi.localIP());
+
+    if (countAsReconnect) {
+        wifiReconnectCount++;
+        Serial.print("WiFi-Reconnects: ");
+        Serial.println(wifiReconnectCount);
+    }
 }
 
 void checkAndReconnectWiFi() {
@@ -158,11 +208,11 @@ void checkAndReconnectWiFi() {
         if (WiFi.status() != WL_CONNECTED) {
             Serial.println("WiFi-Verbindung verloren. Neuverbindung...");
             WiFi.disconnect();
-            initWiFi();
+            initWiFi(true);
         } else if (WiFi.RSSI() < WIFI_SIGNAL_THRESHOLD) {
             Serial.println("Signal schwach. Neuverbindung...");
             WiFi.disconnect();
-            initWiFi();
+            initWiFi(true);
         }
     }
 }
@@ -170,7 +220,7 @@ void checkAndReconnectWiFi() {
 void handleWebServer() {
     WiFiClient client = server.available();
     if (client) {
-        unsigned long clientConnectTime = millis();
+        client.setTimeout(CLIENT_TIMEOUT);
         String request = client.readStringUntil('\r');
         client.flush();
 
@@ -231,7 +281,7 @@ void sendHtmlResponse(WiFiClient& client) {
     const char* rightButtonColor = (millis() - torRechts.getLastSwitchedTime() < 12000) ? COLOR_ORANGE : 
                                    (torRechts.isClosed() ? COLOR_GREEN : COLOR_RED);
     
-    client.println(".buttonL, .buttonR, .buttonCheck, .button2 { border-radius: 5px; box-shadow: 4px 4px 5px rgba(0,0,0,0.3); border: 1px solid geay; color: white; padding: 22px 40px; text-decoration: none; font-size: 20px; margin: 10px; cursor: pointer;}");
+    client.println(".buttonL, .buttonR, .buttonCheck, .button2 { border-radius: 5px; box-shadow: 4px 4px 5px rgba(0,0,0,0.3); border: 1px solid gray; color: white; padding: 22px 40px; text-decoration: none; font-size: 20px; margin: 10px; cursor: pointer;}");
     client.println(".buttonL { background-color: " + String(leftButtonColor) + "; }");
     client.println(".buttonR { background-color: " + String(rightButtonColor) + "; }");
     client.println(".buttonCheck { background-color: #55BBCC; padding: 8px 40px; }");
@@ -255,9 +305,12 @@ void sendHtmlResponse(WiFiClient& client) {
     client.println("<p>automatisch zu in: ");
     
     if (!torRechts.isClosed() || !torLinks.isClosed()) {
-        unsigned long openDuration = millis() - (torLinks.isClosed() ? torRechts.getOpenDuration() : torLinks.getOpenDuration());
-        int restZeit = openTime - (openDuration / 60000);
-        restZeit = restZeit > 0 ? restZeit : 0;  // Ensure non-negative value
+        unsigned long leftOpenDuration = torLinks.isClosed() ? 0 : torLinks.getOpenDuration();
+        unsigned long rightOpenDuration = torRechts.isClosed() ? 0 : torRechts.getOpenDuration();
+        unsigned long relevantOpenDuration = (leftOpenDuration > rightOpenDuration) ? leftOpenDuration : rightOpenDuration;
+
+        long restZeit = (long)openTime - (long)(relevantOpenDuration / 60000);
+        restZeit = restZeit > 0 ? restZeit : 0;
         client.println( String(restZeit) + " min</p>");
     } else {
         client.println(" --- </p>");
@@ -276,39 +329,83 @@ void sendHtmlResponse(WiFiClient& client) {
     }
     client.println(String(openTimeStr) + "</p>");
 
-    char rssiStr[32];
-    snprintf(rssiStr, sizeof(rssiStr), "WiFi-RSSI: %d dB", WiFi.RSSI());
-    client.println(rssiStr);
+    char wifiInfoStr[48];
+    snprintf(wifiInfoStr, sizeof(wifiInfoStr), "WiFi-RSSI: %d dB | Recon: %lu", WiFi.RSSI(), wifiReconnectCount);
+    client.println(wifiInfoStr);
 
     client.println("</body></html>");
 }
 
 void automaticDoorClose() {
-    unsigned long currentMillis = millis();
-    
-    Tor* tores[] = { &torLinks, &torRechts };  // Array von Zeigern auf die Tore
+    unsigned long now = millis();
 
     for (int i = 0; i < 2; i++) {
-        Tor* currentTor = tores[i];  // Aktuelles Tor
+        Tor* currentTor = tores[i];
+        DoorCloseState& state = closeStates[i];
 
-        if (!currentTor->isClosed()) {
-            unsigned long openDuration = currentTor->getOpenDuration();
-            if (openDuration > openTime * 60000) {
-                // Tor einmal auslösen, um es zu schließen
-                currentTor->toggle();  
-                delay(1000);  // Warte kurz, um sicherzustellen, dass das Tor reagiert
-                for (int attempts = 0; attempts < MAX_DOOR_CHECK_ATTEMPTS; attempts++) {
-                    delay(1000);  // Warte eine Sekunde
-                    currentTor->checkStatus();  // Überprüfe den Status des Tores
-                    if (currentTor->isClosed()) {
-                        break;  // Beende die Schleife, wenn das Tor geschlossen ist
-                    }
-                }
-                // Wenn das Tor nach 14 Sekunden immer noch offen ist, schließe es erneut
-                if (!currentTor->isClosed()) {
-                    currentTor->toggle();
+        // Wenn das Tor bereits zu ist, muss kein Retry-Zustand gehalten werden.
+        if (currentTor->isClosed()) {
+            if (state.waitingForCloseCheck) {
+                Serial.print("AUTO-CLOSE [");
+                Serial.print(torNamen[i]);
+                Serial.println("]: geschlossen bestaetigt");
+            }
+            state.waitingForCloseCheck = false;
+            state.attempts = 0;
+            continue;
+        }
+
+        // Erstschritt: Nach Ablauf der Offenzeit einen Schliess-Impuls senden.
+        if (!state.waitingForCloseCheck) {
+            if (currentTor->getOpenDuration() > openTime * 60000UL) {
+                if (currentTor->toggle()) {
+                    Serial.print("AUTO-CLOSE [");
+                    Serial.print(torNamen[i]);
+                    Serial.println("]: Schliess-Impuls gesendet");
+                    state.waitingForCloseCheck = true;
+                    state.attempts = 0;
+                    state.nextCheckMillis = now + DOOR_CHECK_INTERVAL;
                 }
             }
+            continue;
         }
+
+        // Nach dem Impuls nur im Pruefintervall den Sensorstatus evaluieren.
+        if ((long)(now - state.nextCheckMillis) < 0) {
+            continue;
+        }
+
+        currentTor->checkStatus();
+        if (currentTor->isClosed()) {
+            Serial.print("AUTO-CLOSE [");
+            Serial.print(torNamen[i]);
+            Serial.println("]: Tor geschlossen");
+            state.waitingForCloseCheck = false;
+            state.attempts = 0;
+            continue;
+        }
+
+        state.attempts++;
+        Serial.print("AUTO-CLOSE [");
+        Serial.print(torNamen[i]);
+        Serial.print("]: Retry ");
+        Serial.print(state.attempts);
+        Serial.print("/");
+        Serial.println(MAX_DOOR_CHECK_ATTEMPTS);
+
+        if (state.attempts >= MAX_DOOR_CHECK_ATTEMPTS) {
+            // Fallback: Wenn das Tor nach mehreren Pruefungen offen bleibt,
+            // wird ein zweiter Impuls gesendet und der Zyklus beendet.
+            if (currentTor->toggle()) {
+                Serial.print("AUTO-CLOSE [");
+                Serial.print(torNamen[i]);
+                Serial.println("]: Fallback-Impuls gesendet");
+            }
+            state.waitingForCloseCheck = false;
+            state.attempts = 0;
+            continue;
+        }
+
+        state.nextCheckMillis = now + DOOR_CHECK_INTERVAL;
     }
 }
